@@ -1,0 +1,4 @@
+selenium
+requests 
+tldextract 
+rich
