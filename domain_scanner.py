@@ -11,6 +11,22 @@ python script.py domains.txt web --uri /api/test
 
 # IP mode for DNS resolution
 python script.py domains.txt ip
+
+Example output:
+...
+IP: 23.145.152.47
+  Domains (4):
+    • ktdhlds4cw.cc
+    • ktdhlldurq.cc
+    • ktdhllmaxx.cc
+    • ktdhlua2k0.cc
+
+IP: 23.145.152.99
+  Domains (3):
+    • ktdhle56qq.cc
+    • ktdhlg7z1l.cc
+    • ktdhluc174.cc
+...
 """
 
 import argparse

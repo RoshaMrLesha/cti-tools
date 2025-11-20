@@ -10,7 +10,7 @@ Requirements:
 
 Usage:
 python bulk_domain_suspension_check.py \
-  -u myuser -p mypass \
+  -e myemail -p mypass \
   --api-base "https://api.example.com/cases?status=open&brand=Acme" \
   --threads 10
 """
@@ -20,7 +20,7 @@ import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse, parse_qsl
+from urllib.parse import urlparse, parse_qsl, unquote
 
 import requests
 import tldextract
@@ -40,12 +40,12 @@ console = Console()
 
 # ----------------- User-editable defaults -----------------
 API_BASE_DEFAULT = "https://api.example.com"  # placeholder
-LOGIN_ENDPOINT = "/login"
-CASES_ENDPOINT = "/cases"
+LOGIN_ENDPOINT = "/api/v1//auth/sign_in"
+CASES_ENDPOINT = "/api/v1/illigal_cases"
 
 PER_PAGE_DEFAULT = 100
 THREADS_DEFAULT = 5
-WHOIS_TIMEOUT_DEFAULT = 10  # seconds
+WHOIS_TIMEOUT_DEFAULT = 30  # seconds
 ESTIMATED_SECS_PER_WHOIS = 1.7  # for estimation; adjustable
 WARN_THRESHOLD_SECONDS = 15 * 60  # 15 min
 # -----------------------------------------------------------
@@ -55,7 +55,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Bulk WHOIS tool to find domains in clientHold/serverHold."
     )
-    p.add_argument("-u", "--username", required=True, help="API username")
+    p.add_argument("-e", "--email", required=True, help="API email")
     p.add_argument("-p", "--password", required=True, help="API password")
     p.add_argument(
         "--api-base",
@@ -96,10 +96,18 @@ def parse_args():
 # ----------------- API Helpers -----------------
 
 
-def login(api_base: str, username: str, password: str, verbose: bool) -> str:
+def login(api_base: str, email: str, password: str, verbose: bool) -> str:
+    """
+    Sign-in using email/password.
+
+    - POST to LOGIN_ENDPOINT on the same host as api_base.
+    - Expect cookies `_obp_session` and `_obp_token` to be set.
+    - Return an authenticated requests.Session carrying those cookies.
+    """
     console.print("[bold]Stage 0: Logging in[/bold]")
 
-    # api_base may include query/path for cases; login is still based on host
+    session = requests.Session()
+
     parsed = urlparse(api_base)
     if parsed.scheme:
         base_root = f"{parsed.scheme}://{parsed.netloc}"
@@ -107,48 +115,58 @@ def login(api_base: str, username: str, password: str, verbose: bool) -> str:
         base_root = api_base.rstrip("/")
 
     url = base_root.rstrip("/") + LOGIN_ENDPOINT
+
     try:
-        resp = requests.post(
-            url, json={"username": username, "password": password}, timeout=15
+        resp = session.post(
+            url, json={"email": email, "password": password}, timeout=15
         )
     except Exception as e:
         raise RuntimeError(f"Login request failed: {e}")
 
     if verbose:
+        console.print(f"Login URL: {url}")
         console.print(f"Login response: HTTP {resp.status_code}")
+        console.print(f"Set-Cookie: {resp.headers.get('Set-Cookie', '')}")
 
     if resp.status_code != 200:
         raise RuntimeError(f"Login failed: HTTP {resp.status_code} - {resp.text}")
 
-    data = resp.json()
-    token = data.get("token") or data.get("access_token")
-    if not token and isinstance(data, dict):
-        for v in data.values():
-            if isinstance(v, str) and len(v) > 10:
-                token = v
-                break
+    # Raw cookies from the session's jar
+    cookies_raw = session.cookies.get_dict()
+    # URL-decoded view of the cookies (for checking / logging)
+    cookies_decoded = {k: unquote(v) for k, v in cookies_raw.items()}
 
-    if not token:
-        raise RuntimeError("Login succeeded but no token found. Adjust parsing.")
+    if verbose:
+        console.print(f"Cookies (raw): {cookies_raw}")
+        console.print(f"Cookies (decoded): {cookies_decoded}")
 
-    console.print("[green]Login successful.[/green]")
-    return token
+    if "_obp_token" not in cookies_decoded:
+        raise RuntimeError(
+            "Login succeeded but expected cookie '_obp_token' "
+            "was not found (after URL-decoding). Adjust login endpoint or cookie names if needed."
+        )
+
+    console.print("[green]Login successful. Auth cookies stored in session.[/green]")
+    # Note: session itself still holds the original cookie values for HTTP use.
+    return session
+
+
 
 
 def prepare_cases_url_and_params(
     api_base: str, per_page_default: int, verbose: bool
-) -> Tuple[str, Dict[str, str], int]:
+) -> Tuple[str, List[Tuple[str, str]], int]:
     """
     Parse --api-base which can include path and query params for filtering/search.
 
     - If api_base has no scheme, treat it as a bare base and append /cases.
     - If it has scheme, we keep its path as-is (even if /cases/search etc.).
-    - We parse existing query params and add defaults:
-        * per_page if not present
-        * size if not present
+    - Query parameters may repeat (e.g. by_states[]=open&by_states[]=change_detected),
+      so we preserve ALL values using a list of (key, value) tuples.
+    - We add defaults for per_page and size if they are not already present.
     - Returns:
         base_url (without query),
-        base_params (dict),
+        base_params (list of (key, value)),
         effective_page_size (int) used for pagination heuristics.
     """
     parsed = urlparse(api_base)
@@ -156,54 +174,67 @@ def prepare_cases_url_and_params(
     if not parsed.scheme:
         # No scheme -> treat as simple host/base, use /cases
         base_url = api_base.rstrip("/") + CASES_ENDPOINT
-        base_params: Dict[str, str] = {}
+        base_params: List[Tuple[str, str]] = []
     else:
         # Use provided path as-is; if empty, default to /cases
         path = parsed.path or CASES_ENDPOINT
         base_url = f"{parsed.scheme}://{parsed.netloc}{path}"
-        base_params = dict(parse_qsl(parsed.query))
+        # keep_blank_values=True to preserve things like key=&
+        base_params = list(parse_qsl(parsed.query, keep_blank_values=True))
 
-    # Provide defaults if missing
-    if "per_page" not in base_params:
-        base_params["per_page"] = str(per_page_default)
-    if "size" not in base_params:
-        base_params["size"] = str(per_page_default)
+    # Check if per_page / size already present (possibly multiple times)
+    has_per_page = any(k == "per_page" for k, _ in base_params)
+    has_size = any(k == "size" for k, _ in base_params)
 
-    # Determine effective page size (prefer explicit per_page, otherwise size)
+    # Only add defaults if not present at all
+    if not has_per_page:
+        base_params.append(("per_page", str(per_page_default)))
+    if not has_size:
+        base_params.append(("size", str(per_page_default)))
+
+    # Determine effective page size.
+    # Prefer the last per_page, otherwise last size, otherwise default.
     effective_page_size = per_page_default
-    if "per_page" in base_params:
-        try:
-            effective_page_size = int(base_params["per_page"])
-        except ValueError:
-            pass
-    elif "size" in base_params:
-        try:
-            effective_page_size = int(base_params["size"])
-        except ValueError:
-            pass
+    found = False
+    for k, v in reversed(base_params):
+        if k == "per_page":
+            try:
+                effective_page_size = int(v)
+                found = True
+            except ValueError:
+                pass
+            break
+    if not found:
+        for k, v in reversed(base_params):
+            if k == "size":
+                try:
+                    effective_page_size = int(v)
+                except ValueError:
+                    pass
+                break
 
     if verbose:
         console.print(f"Cases base URL: {base_url}")
-        console.print(f"Base query params: {base_params}")
+        console.print(f"Base query params (preserving duplicates): {base_params}")
         console.print(f"Effective page size: {effective_page_size}")
 
     return base_url, base_params, effective_page_size
 
 
 def fetch_cases_page(
+    session: requests.Session,
     base_url: str,
-    base_params: Dict[str, str],
-    token: str,
+    base_params: List[Tuple[str, str]],
     page: int,
     verbose: bool,
 ) -> Dict:
-    headers = {"Authorization": f"Bearer {token}"}
+    """
+    Fetch a single page of cases using the authenticated session and provided filters.
+    """
+    params = list(base_params)
+    params.append(("page", str(page)))
 
-    # Merge base params + current page
-    params = dict(base_params)
-    params["page"] = str(page)
-
-    resp = requests.get(base_url, headers=headers, params=params, timeout=30)
+    resp = session.get(base_url, params=params, timeout=30)
     if verbose:
         console.print(f"GET {resp.url} -> {resp.status_code}")
     resp.raise_for_status()
@@ -211,9 +242,9 @@ def fetch_cases_page(
 
 
 def collect_all_cases(
+    session: requests.Session,
     base_url: str,
-    base_params: Dict[str, str],
-    token: str,
+    base_params: List[Tuple[str, str]],
     effective_page_size: int,
     verbose: bool,
 ) -> List[Dict]:
@@ -225,7 +256,7 @@ def collect_all_cases(
 
     while True:
         try:
-            js = fetch_cases_page(base_url, base_params, token, page, verbose)
+            js = fetch_cases_page(session, base_url, base_params, page, verbose)
         except Exception as e:
             if not retry_once:
                 console.print(
@@ -233,15 +264,16 @@ def collect_all_cases(
                 )
                 retry_once = True
                 try:
-                    js = fetch_cases_page(base_url, base_params, token, page, verbose)
+                    js = fetch_cases_page(session, base_url, base_params, page, verbose)
                 except Exception as e2:
                     raise RuntimeError(f"Failed again fetching page {page}: {e2}")
             else:
                 raise
 
         data = js.get("data", [])
+        total_cases = js.get("total_count", "Unknown")
         cases.extend(data)
-        console.print(f"  Page {page}: {len(data)} cases (total {len(cases)})")
+        console.print(f"  Page {page}: {len(data)} cases (total {len(cases)}) out of {total_cases}")
 
         # Stop when last page is reached (fewer than effective_page_size items)
         if not data or len(data) < effective_page_size:
@@ -400,8 +432,8 @@ def main():
     args = parse_args()
     verbose = args.verbose
 
-    # Stage 0: login
-    token = login(args.api_base, args.username, args.password, verbose)
+    # Stage 0: login -> get authenticated session with cookies
+    session = login(args.api_base, args.email, args.password, verbose)
 
     # Prepare base URL & params for /cases (with filters/search)
     base_url, base_params, effective_page_size = prepare_cases_url_and_params(
@@ -410,7 +442,7 @@ def main():
 
     # Stage 1: collect cases
     cases = collect_all_cases(
-        base_url, base_params, token, effective_page_size, verbose
+        session, base_url, base_params, effective_page_size, verbose
     )
 
     # Extract domains from cases
