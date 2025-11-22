@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
 Domain Scanner - Web Screenshot & DNS Resolution Tool
-Usage: python script.py <file> <mode> [--uri <path>]
-
-# Web mode with screenshots
-python script.py domains.txt web
-
-# Web mode with URI path
-python script.py domains.txt web --uri /api/test
+Usage: python domain_scanner.py <file> <mode> [--uri <path>]
 
 # IP mode for DNS resolution
-python script.py domains.txt ip
+python domain_scanner.py domains.txt ip
+
+# Web mode with screenshots (in development)
+python domain_scanner.py domains.txt web
+python script.py domains.txt web --uri /api/test
 
 Example output:
 ...
